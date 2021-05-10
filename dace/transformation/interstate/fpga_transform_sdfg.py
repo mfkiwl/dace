@@ -1,15 +1,25 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """ Contains inter-state transformations of an SDFG to run on an FPGA. """
 
 import networkx as nx
 
-from dace import registry
-from dace.transformation import pattern_matching
+from dace import registry, properties
+from dace.transformation import transformation
 
 
 @registry.autoregister
-class FPGATransformSDFG(pattern_matching.Transformation):
+@properties.make_properties
+class FPGATransformSDFG(transformation.Transformation):
     """ Implements the FPGATransformSDFG transformation, which takes an entire
         SDFG and transforms it into an FPGA-capable SDFG. """
+
+    promote_global_trans = properties.Property(
+        dtype=bool,
+        default=True,
+        desc=
+        "If True, transient arrays that are fully internal are pulled out so "
+        "that they can be allocated on the host.")
+
     @staticmethod
     def annotates_memlets():
         return True
@@ -44,7 +54,7 @@ class FPGATransformSDFG(pattern_matching.Transformation):
 
         sdfg_id = sdfg.sdfg_id
         nesting = NestSDFG(sdfg_id, -1, {}, self.expr_index)
-        nesting.promote_global_trans = True
+        nesting.promote_global_trans = self.promote_global_trans
         nesting.apply(sdfg)
 
         fpga_transform = FPGATransformState(sdfg_id, -1,

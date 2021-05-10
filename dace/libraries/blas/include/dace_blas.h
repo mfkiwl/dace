@@ -1,3 +1,4 @@
+// Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 #pragma once
 
 #include <complex>  // std::complex<float>, std::complex<double>

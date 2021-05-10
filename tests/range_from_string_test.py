@@ -1,3 +1,4 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """Implements unit tests for dace.subsets.Range.from_string method."""
 
 import unittest

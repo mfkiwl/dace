@@ -1,6 +1,8 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """ Tests that generate various instrumentation reports with timers and
     performance counters. """
 
+import pytest
 import numpy as np
 import sys
 
@@ -12,8 +14,7 @@ N = dace.symbol('N')
 
 
 @dace.program
-def slowmm(A: dace.float64[N, N], B: dace.float64[N, N], C: dace.float64[N,
-                                                                         N]):
+def slowmm(A: dace.float64[N, N], B: dace.float64[N, N], C: dace.float64[N, N]):
     for t in range(20):
 
         @dace.map
@@ -31,6 +32,7 @@ def onetest(instrumentation: dace.InstrumentationType, size=128):
     C = np.zeros([size, size], dtype=np.float64)
 
     sdfg: dace.SDFG = slowmm.to_sdfg()
+    sdfg.name = f"instrumentation_test_{instrumentation.name}"
     sdfg.apply_strict_transformations()
 
     # Set instrumentation both on the state and the map
@@ -58,11 +60,13 @@ def test_timer():
     onetest(dace.InstrumentationType.Timer)
 
 
+@pytest.mark.papi
 def test_papi():
     # Run a lighter load for the sake of performance
     onetest(dace.InstrumentationType.PAPI_Counters, 4)
 
 
+@pytest.mark.gpu
 def test_gpu_events():
     onetest(dace.InstrumentationType.GPU_Events)
 

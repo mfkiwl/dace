@@ -1,3 +1,4 @@
+// Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 ////////////////////////////////////////////////////////////////////////
 // Define some operators on vector types
 
@@ -111,7 +112,29 @@
             if (index == U(0)) return x;                               \
             return y;                                                  \
         }                                                              \
-    };
+    };\
+    template <typename U>                                          \
+        static DACE_HDFI exttype_##T##_##2 operator+(const U &a, const exttype_##T##_##2& b) {  \
+            exttype_##T##_##2 result;                                  \
+            result.x = a + b.x;                                      \
+            result.y = a + b.y;                                      \
+            return result;                                             \
+        }\
+        template <typename U>                                          \
+        static DACE_HDFI exttype_##T##_##2 operator-(const U &a, const exttype_##T##_##2& b) {  \
+            exttype_##T##_##2 result;                                  \
+            result.x = a - b.x;                                      \
+            result.y = a - b.y;                                      \
+            return result;                                             \
+        }\
+        template <typename U>                                          \
+        static DACE_HDFI exttype_##T##_##2 operator*(const U &a, const exttype_##T##_##2& b) {  \
+            exttype_##T##_##2 result;                                  \
+            result.x = a * b.x;                                      \
+            result.y = a * b.y;                                      \
+            return result;                                             \
+        }                                     
+
 #define DEFINE_EXTTYPE3(T, NAME)                                       \
     struct exttype_##T##_##3 : NAME##3 {                               \
         DACE_HDFI exttype_##T##_##3 operator*(const exttype_##T##_##3 &other) const {  \
@@ -324,3 +347,23 @@ DEFINE_ALL_EXT_TYPES(float64,double);
     DEFINE_VECTYPE(float32, 3);
     DEFINE_VECTYPE(float32, 4);
     DEFINE_VECTYPE(float64, 2);
+
+    // Special case for half-precision
+    template<>
+    struct _vtype<half, 2>
+    {
+        typedef half2 aligned;
+        typedef aligned unaligned;
+    };
+    template<>
+    struct _vtype<half, 4>
+    {
+        typedef half4 aligned;
+        typedef aligned unaligned;
+    };
+    template<>
+    struct _vtype<half, 8>
+    {
+        typedef half8 aligned;
+        typedef aligned unaligned;
+    };

@@ -1,3 +1,4 @@
+// Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 #ifndef __DACE_REDUCTION_H
 #define __DACE_REDUCTION_H
 
@@ -146,7 +147,7 @@ namespace dace {
         // Non-conflicting version --> no critical section
         template <typename WCR>
         static DACE_HDFI double reduce(WCR wcr, double *ptr, const double& value) {
-            double old;
+            double old = *ptr;
             *ptr = wcr(old, value);
             return old;
         }
@@ -194,6 +195,20 @@ namespace dace {
         }
 
         DACE_HDFI double operator()(const double &a, const double &b) const { return a + b; }
+    };
+#endif
+
+#if defined(DACE_USE_GPU_ATOMICS)
+    template <>
+    struct _wcr_fixed<ReductionType::Sum, long long> {
+       
+        static DACE_HDFI long long reduce_atomic(long long *ptr, const long long& value) {
+            return _wcr_fixed<ReductionType::Sum, unsigned long long>::reduce_atomic((
+                unsigned long long *)ptr, 
+                static_cast<unsigned long long>(value));
+        }
+
+        DACE_HDFI long long operator()(const long long &a, const long long &b) const { return a + b; }
     };
 #endif
 

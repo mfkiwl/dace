@@ -1,3 +1,4 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 import unittest
 from aenum import Enum, auto
 from dace import registry

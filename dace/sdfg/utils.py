@@ -1,13 +1,17 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """ Various utility functions to create, traverse, and modify SDFGs. """
 
 import collections
 import copy
+import os
+import networkx as nx
+from dace.sdfg.graph import MultiConnectorEdge
 from dace.sdfg.sdfg import SDFG
 from dace.sdfg.state import SDFGState
 from dace.sdfg import nodes as nd, graph as gr
-from dace import data as dt, dtypes, subsets as sbs
+from dace import config, data as dt, dtypes, memlet as mm, subsets as sbs, symbolic
 from string import ascii_uppercase
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 
 def node_path_graph(*args):
@@ -103,7 +107,7 @@ def dfs_topological_sort(G, sources=None, condition=None):
     :param sources: (optional) node or list of nodes that
                     specify starting point(s) for depth-first search and return
                     edges in the component reachable from source.
-    :return: A generator of edges in the lastvisit depth-first-search.
+    :return: A generator of nodes in the lastvisit depth-first-search.
 
     @note: Based on http://www.ics.uci.edu/~eppstein/PADS/DFS.py
     by D. Eppstein, July 2004.
@@ -151,6 +155,52 @@ def dfs_topological_sort(G, sources=None, condition=None):
                 stack.pop()
 
 
+def dfs_conditional(G, sources=None, condition=None):
+    """ Produce nodes in a depth-first ordering.
+
+    :param G: An input DiGraph (assumed acyclic).
+    :param sources: (optional) node or list of nodes that
+                    specify starting point(s) for depth-first search and return
+                    edges in the component reachable from source.
+    :return: A generator of edges in the lastvisit depth-first-search.
+
+    @note: Based on http://www.ics.uci.edu/~eppstein/PADS/DFS.py
+    by D. Eppstein, July 2004.
+
+    @note: If a source is not specified then a source is chosen arbitrarily and
+    repeatedly until all components in the graph are searched.
+
+    """
+    if sources is None:
+        # produce edges for all components
+        nodes = G
+    else:
+        # produce edges for components with source
+        try:
+            nodes = iter(sources)
+        except TypeError:
+            nodes = [sources]
+
+    visited = set()
+    for start in nodes:
+        if start in visited:
+            continue
+        yield start
+        visited.add(start)
+        stack = [(start, iter(G.neighbors(start)))]
+        while stack:
+            parent, children = stack[-1]
+            try:
+                child = next(children)
+                if child not in visited:
+                    visited.add(child)
+                    if condition is None or condition(parent, child):
+                        yield child
+                        stack.append((child, iter(G.neighbors(child))))
+            except StopIteration:
+                stack.pop()
+
+
 def change_edge_dest(graph: gr.OrderedDiGraph,
                      node_a: Union[nd.Node, gr.OrderedMultiDiConnectorGraph],
                      node_b: Union[nd.Node, gr.OrderedMultiDiConnectorGraph]):
@@ -159,11 +209,11 @@ def change_edge_dest(graph: gr.OrderedDiGraph,
         The function finds all edges in the graph that have node A as their
         destination. It then creates a new edge for each one found,
         using the same source nodes and data, but node B as the destination.
-        Afterwards, it deletes the edges found and inserts the new ones into 
+        Afterwards, it deletes the edges found and inserts the new ones into
         the graph.
 
         :param graph: The graph upon which the edge transformations will be
-                      applied.  
+                      applied.
         :param node_a: The original destination of the edges.
         :param node_b: The new destination of the edges to be transformed.
     """
@@ -186,9 +236,9 @@ def change_edge_src(graph: gr.OrderedDiGraph,
                     node_b: Union[nd.Node, gr.OrderedMultiDiConnectorGraph]):
     """ Changes the sources of edges from node A to node B.
 
-        The function finds all edges in the graph that have node A as their 
-        source. It then creates a new edge for each one found, using the same 
-        destination nodes and data, but node B as the source. Afterwards, it 
+        The function finds all edges in the graph that have node A as their
+        source. It then creates a new edge for each one found, using the same
+        destination nodes and data, but node B as the source. Afterwards, it
         deletes the edges
         found and inserts the new ones into the graph.
 
@@ -214,7 +264,7 @@ def change_edge_src(graph: gr.OrderedDiGraph,
 def find_source_nodes(graph):
     """ Finds the source nodes of a graph.
 
-        The function finds the source nodes of a graph, i.e. the nodes with 
+        The function finds the source nodes of a graph, i.e. the nodes with
         zero in-degree.
 
         :param graph: The graph whose source nodes are being searched for.
@@ -259,7 +309,7 @@ def merge_maps(
     # Create merged map by inheriting attributes from outer map and using
     # the merge functions for parameters and ranges.
     merged_map = copy.deepcopy(outer_map)
-    merged_map.label = 'merged_' + outer_map.label
+    merged_map.label = outer_map.label
     merged_map.params = param_merge(outer_map.params, inner_map.params)
     merged_map.range = range_merge(outer_map.range, inner_map.range)
 
@@ -272,6 +322,25 @@ def merge_maps(
     merged_exit.out_connectors = outer_map_exit.out_connectors
 
     graph.add_nodes_from([merged_entry, merged_exit])
+
+    # Handle the case of dynamic map inputs in the inner map
+    inner_dynamic_map_inputs = dynamic_map_inputs(graph, inner_map_entry)
+    for edge in inner_dynamic_map_inputs:
+        remove_conn = (len(list(graph.out_edges_by_connector(edge.src,
+            edge.src_conn))) == 1)
+        conn_to_remove = edge.src_conn[4:]
+        if remove_conn:
+            merged_entry.remove_in_connector('IN_' + conn_to_remove)
+            merged_entry.remove_out_connector('OUT_' + conn_to_remove)
+        merged_entry.add_in_connector(
+            edge.dst_conn, inner_map_entry.in_connectors[edge.dst_conn])
+        outer_edge = next(
+            graph.in_edges_by_connector(outer_map_entry,
+                                        'IN_' + conn_to_remove))
+        graph.add_edge(outer_edge.src, outer_edge.src_conn, merged_entry,
+                       edge.dst_conn, outer_edge.data)
+        if remove_conn:
+            graph.remove_edge(outer_edge)
 
     # Redirect inner in edges.
     for edge in graph.out_edges(inner_map_entry):
@@ -363,7 +432,11 @@ def consolidate_edges_scope(
                               if ed.dst_conn == conn_to_remove)
         out_edge.data.subset = sbs.union(out_edge.data.subset,
                                          edge_to_remove.data.subset)
-        state.remove_edge(edge_to_remove)
+
+        # Check if dangling connectors have been created and remove them,
+        # as well as their parent edges
+        remove_edge_and_dangling_path(state, edge_to_remove)
+
         consolidated += 1
         # Inner side of the scope - remove and reconnect
         remove_inner_connector(e.src_conn)
@@ -373,7 +446,56 @@ def consolidate_edges_scope(
     return consolidated
 
 
-def consolidate_edges(sdfg: SDFG) -> int:
+def remove_edge_and_dangling_path(state: SDFGState, edge: MultiConnectorEdge):
+    """
+    Removes an edge and all of its parent edges in a memlet path, cleaning
+    dangling connectors and isolated nodes resulting from the removal.
+    :param state: The state in which the edge exists.
+    :param edge: The edge to remove.
+    """
+    mtree = state.memlet_tree(edge)
+    inwards = (isinstance(edge.src, nd.EntryNode)
+               or isinstance(edge.dst, nd.EntryNode))
+
+    # Traverse tree upwards, removing edges and connectors as necessary
+    curedge = mtree
+    while curedge is not None:
+        e = curedge.edge
+        state.remove_edge(e)
+        if inwards:
+            neighbors = [
+                neighbor for neighbor in state.out_edges(e.src)
+                if e.src_conn == neighbor.src_conn
+            ]
+        else:
+            neighbors = [
+                neighbor for neighbor in state.in_edges(e.dst)
+                if e.dst_conn == neighbor.dst_conn
+            ]
+        if len(neighbors) > 0:  # There are still edges connected, leave as-is
+            break
+
+        # Remove connector and matching outer connector
+        if inwards:
+            if e.src_conn:
+                e.src.remove_out_connector(e.src_conn)
+                e.src.remove_in_connector('IN' + e.src_conn[3:])
+        else:
+            if e.dst_conn:
+                e.dst.remove_in_connector(e.dst_conn)
+                e.src.remove_out_connector('OUT' + e.dst_conn[2:])
+
+        # Continue traversing upwards
+        curedge = curedge.parent
+    else:
+        # Check if an isolated node have been created at the root and remove
+        root_edge = mtree.root().edge
+        root_node: nd.Node = root_edge.src if inwards else root_edge.dst
+        if state.degree(root_node) == 0:
+            state.remove_node(root_node)
+
+
+def consolidate_edges(sdfg: SDFG, starting_scope=None) -> int:
     """
     Union scope-entering memlets relating to the same data node in all states.
     This effectively reduces the number of connectors and allows more
@@ -382,10 +504,15 @@ def consolidate_edges(sdfg: SDFG) -> int:
     :param sdfg: The SDFG to consolidate.
     :return: Number of edges removed.
     """
+    from dace.sdfg.propagation import propagate_memlets_sdfg, propagate_memlets_scope
+
     consolidated = 0
     for state in sdfg.nodes():
         # Start bottom-up
-        queue = state.scope_leaves()
+        if starting_scope and starting_scope.entry not in state.nodes():
+            continue
+
+        queue = [starting_scope] if starting_scope else state.scope_leaves()
         next_queue = []
         while len(queue) > 0:
             for scope in queue:
@@ -395,6 +522,17 @@ def consolidate_edges(sdfg: SDFG) -> int:
                     next_queue.append(scope.parent)
             queue = next_queue
             next_queue = []
+
+        if starting_scope is not None:
+            # Repropagate memlets from this scope outwards
+            propagate_memlets_scope(sdfg, state, starting_scope)
+
+            # No need to traverse other states
+            break
+
+    # Repropagate memlets
+    if starting_scope is None:
+        propagate_memlets_sdfg(sdfg)
 
     return consolidated
 
@@ -443,6 +581,89 @@ def is_array_stream_view(sdfg: SDFG, dfg: SDFGState, node: nd.AccessNode):
                 sdfg).src = node.data  # TODO: Move src/sink to node, not array
             return True
     return False
+
+
+def get_view_node(state: SDFGState, view: nd.AccessNode) -> nd.AccessNode:
+    """
+    Given a view access node, returns the viewed access node 
+    if existent, else None
+    """
+    view_edge = get_view_edge(state, view)
+    if view_edge is None:
+        return None
+    if view_edge.dst == view:
+        return view_edge.src
+    else:
+        return view_edge.dst
+
+
+def get_view_edge(state: SDFGState,
+                  view: nd.AccessNode) -> gr.MultiConnectorEdge[mm.Memlet]:
+    """
+    Given a view access node, returns the 
+    incoming/outgoing edge which points to the viewed access node.
+    See the ruleset in the documentation of ``dace.data.View``.
+
+    :param state: The state in which the view resides.
+    :param view: The view access node.
+    :return: An edge pointing to the viewed data or None if view is invalid.
+    :see: ``dace.data.View``
+    """
+
+    in_edges = state.in_edges(view)
+    out_edges = state.out_edges(view)
+
+    # Invalid case: No data to view
+    if len(in_edges) == 0 or len(out_edges) == 0:
+        return None
+
+    # If there is one edge (in/out) that leads (via memlet path) to an access
+    # node, and the other side (out/in) has a different number of edges.
+    if len(in_edges) == 1 and len(out_edges) != 1:
+        return in_edges[0]
+    if len(out_edges) == 1 and len(in_edges) != 1:
+        return out_edges[0]
+    if len(out_edges) == len(in_edges) and len(out_edges) != 1:
+        return None
+
+    in_edge = in_edges[0]
+    out_edge = out_edges[0]
+
+    # If there is one incoming and one outgoing edge, and one leads to a code
+    # node, the one that leads to an access node is the viewed data.
+    inmpath = state.memlet_path(in_edge)
+    outmpath = state.memlet_path(out_edge)
+    src_is_data, dst_is_data = False, False
+    if isinstance(inmpath[0].src, nd.AccessNode):
+        src_is_data = True
+    if isinstance(outmpath[-1].dst, nd.AccessNode):
+        dst_is_data = True
+
+    if src_is_data and not dst_is_data:
+        return in_edge
+    if not src_is_data and dst_is_data:
+        return out_edge
+    if not src_is_data and not dst_is_data:
+        return None
+
+    # If both sides lead to access nodes, if one memlet's data points to the
+    # view it cannot point to the viewed node.
+    if in_edge.data.data == view.data and out_edge.data.data != view.data:
+        return out_edge
+    if in_edge.data.data != view.data and out_edge.data.data == view.data:
+        return in_edge
+    if in_edge.data.data == view.data and out_edge.data.data == view.data:
+        return None
+
+    # If both memlets' data are the respective access nodes, the access
+    # node at the highest scope is the one that is viewed.
+    if isinstance(in_edge.src, nd.EntryNode):
+        return in_edge
+    if isinstance(out_edge.dst, nd.ExitNode):
+        return out_edge
+
+    # If both access nodes reside in the same scope, the input data is viewed.
+    return in_edge
 
 
 def dynamic_map_inputs(state: SDFGState,
@@ -630,7 +851,7 @@ def local_transients(sdfg, dfg, entry_node):
     """ Returns transients local to the scope defined by the specified entry
         node in the dataflow graph. """
     state: SDFGState = dfg._graph
-    scope_dict = state.scope_dict(node_to_children=True)
+    scope_children = state.scope_children()
     scope_tree = state.scope_tree()
     current_scope = scope_tree[entry_node]
 
@@ -638,61 +859,166 @@ def local_transients(sdfg, dfg, entry_node):
     defined_transients = set(sdfg.shared_transients())
 
     # Get access nodes in current scope
-    transients = _transients_in_scope(sdfg, current_scope, scope_dict)
+    transients = _transients_in_scope(sdfg, current_scope, scope_children)
 
     # Add transients defined in parent scopes
     while current_scope.parent is not None:
         current_scope = current_scope.parent
         defined_transients.update(
-            _transients_in_scope(sdfg, current_scope, scope_dict))
+            _transients_in_scope(sdfg, current_scope, scope_children))
 
     return sorted(list(transients - defined_transients))
 
 
-def trace_nested_access(node, state, sdfg):
-    """ 
+def trace_nested_access(
+        node: nd.AccessNode, state: SDFGState,
+        sdfg: SDFG) -> List[Tuple[nd.AccessNode, SDFGState, SDFG]]:
+    """
     Given an AccessNode in a nested SDFG, trace the accessed memory
     back to the outermost scope in which it is defined.
 
     :param node: An access node.
     :param state: State in which the access node is located.
     :param sdfg: SDFG in which the access node is located.
-    :return: A list of scopes (node, state, sdfg) in which the given
-                data is accessed, from outermost scope to innermost scope.
+    :return: A list of scopes ((input_node, output_node), (memlet_read, memlet_write), state, sdfg) in which
+             the given data is accessed, from outermost scope to innermost
+             scope.
     """
-    if node.access == dtypes.AccessType.ReadWrite:
-        raise NotImplementedError("Access node must be read or write only")
-    curr_node = node
     curr_sdfg = sdfg
-    trace = [(node, state, sdfg)]
+    curr_read = None
+    memlet_read = None
+    for m in state.out_edges(node):
+        if not m.data.is_empty():
+            curr_read = node
+            memlet_read = m.data
+            break
+
+    curr_write = None
+    memlet_write = None
+    for m in state.in_edges(node):
+        if not m.data.is_empty():
+            curr_write = node
+            memlet_read = m.data
+            break
+
+    trace = [((curr_read, curr_write), (memlet_read, memlet_write), state, sdfg)
+             ]
+
     while curr_sdfg.parent is not None:
         curr_state = curr_sdfg.parent
+
         # Find the nested SDFG containing ourself in the parent state
-        for nested_sdfg in curr_state.nodes():
-            if isinstance(nested_sdfg,
-                          nd.NestedSDFG) and nested_sdfg.sdfg == curr_sdfg:
-                break
-        else:
-            raise ValueError("{} not found in its parent state {}".format(
-                curr_sdfg.name, curr_state.label))
-        if node.access == dtypes.AccessType.ReadOnly:
+        nested_sdfg = curr_sdfg.parent_nsdfg_node
+
+        if curr_read is not None:
             for e in curr_state.in_edges(nested_sdfg):
-                if e.dst_conn == curr_node.data:
+                if e.dst_conn == curr_read.data:
                     # See if the input to this connector traces back to an
                     # access node. If not, just give up here
-                    curr_node = find_input_arraynode(curr_state, e)
-                    curr_sdfg = curr_state.parent  # Exit condition
-                    if isinstance(curr_node, nd.AccessNode):
-                        trace.append((curr_node, curr_state, curr_sdfg))
-                    break
-        if node.access == dtypes.AccessType.WriteOnly:
+                    n = find_input_arraynode(curr_state, e)
+                    if isinstance(n, nd.AccessNode):
+                        curr_read = n
+                        memlet_read = e.data
+                        break
+            else:
+                curr_read = None
+                memlet_read = None
+        if curr_write is not None:
             for e in curr_state.out_edges(nested_sdfg):
-                if e.src_conn == curr_node.data:
+                if e.src_conn == curr_write.data:
                     # See if the output of this connector traces back to an
                     # access node. If not, just give up here
-                    curr_node = find_output_arraynode(curr_state, e)
-                    curr_sdfg = curr_state.parent  # Exit condition
-                    if isinstance(curr_node, nd.AccessNode):
-                        trace.append((curr_node, curr_state, curr_sdfg))
-                    break
+                    n = find_output_arraynode(curr_state, e)
+                    if isinstance(curr_write, nd.AccessNode):
+                        curr_write = n
+                        memlet_write = e.data
+                        break
+            else:
+                curr_write = None
+                memlet_write = None
+        if curr_read is not None or curr_write is not None:
+            trace.append(((curr_read, curr_write), (memlet_read, memlet_write),
+                          curr_state, curr_state.parent))
+        else:
+            break
+        curr_sdfg = curr_state.parent  # Recurse
     return list(reversed(trace))
+
+
+def fuse_states(sdfg: SDFG) -> int:
+    """
+    Fuses all possible states of an SDFG (and all sub-SDFGs) using an optimized
+    routine that uses the structure of the StateFusion transformation.
+    :param sdfg: The SDFG to transform.
+    :return: The total number of states fused.
+    """
+    from dace.transformation.interstate import StateFusion  # Avoid import loop
+    counter = 0
+    for sd in sdfg.all_sdfgs_recursive():
+        id = sd.sdfg_id
+        while True:
+            edges = list(sd.nx.edges)
+            applied = 0
+            skip_nodes = set()
+            for u, v in edges:
+                if u in skip_nodes or v in skip_nodes:
+                    continue
+                candidate = {
+                    StateFusion.first_state: u,
+                    StateFusion.second_state: v
+                }
+                sf = StateFusion(id, -1, candidate, 0, override=True)
+                if sf.can_be_applied(sd, candidate, 0, sd, strict=True):
+                    sf.apply(sd)
+                    applied += 1
+                    counter += 1
+                    skip_nodes.add(u)
+                    skip_nodes.add(v)
+            if applied == 0:
+                break
+    if config.Config.get_bool('debugprint'):
+        print(f'Applied {counter} State Fusions')
+    return counter
+
+
+def load_precompiled_sdfg(folder: str):
+    """
+    Loads a pre-compiled SDFG from an output folder (e.g. ".dacecache/program").
+    Folder must contain a file called "program.sdfg" and a subfolder called
+    "build" with the shared object.
+
+    :param folder: Path to SDFG output folder.
+    :return: A callable CompiledSDFG object.
+    """
+    from dace.codegen import compiled_sdfg as csdfg
+    sdfg = SDFG.from_file(os.path.join(folder, 'program.sdfg'))
+    suffix = config.Config.get('compiler', 'library_extension')
+    return csdfg.CompiledSDFG(
+        sdfg,
+        csdfg.ReloadableDLL(
+            os.path.join(folder, 'build', f'lib{sdfg.name}.{suffix}'),
+            sdfg.name))
+
+
+def get_next_nonempty_states(sdfg: SDFG, state: SDFGState) -> Set[SDFGState]:
+    """
+    From the given state, return the next set of states that are reachable
+    in the SDFG, skipping empty states. Traversal stops at the non-empty 
+    state.
+    This function is used to determine whether synchronization should happen
+    at the end of a GPU state.
+    :param sdfg: The SDFG that contains the state.
+    :param state: The state to start from.
+    :return: A set of reachable non-empty states.
+    """
+    result: Set[SDFGState] = set()
+
+    # Traverse children until states are not empty
+    for succ in sdfg.successors(state):
+        result |= set(dfs_conditional(sdfg, sources=[succ],
+                    condition=lambda parent, _: parent.is_empty()))
+
+    # Filter out empty states
+    result = {s for s in result if not s.is_empty()}
+
+    return result

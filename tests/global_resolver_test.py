@@ -1,3 +1,4 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 import astunparse
 import unittest
 from dace.frontend.python.newast import GlobalResolver

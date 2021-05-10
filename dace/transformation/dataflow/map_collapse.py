@@ -1,17 +1,18 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """ Contains classes that implement the map-collapse transformation. """
 
 from dace import registry
 from dace.symbolic import symlist
 from dace.sdfg import nodes
 from dace.sdfg import utils as sdutil
-from dace.transformation import pattern_matching
+from dace.transformation import transformation
 from dace.properties import make_properties
 from typing import Tuple
 
 
 @registry.autoregister_params(singlestate=True)
 @make_properties
-class MapCollapse(pattern_matching.Transformation):
+class MapCollapse(transformation.Transformation):
     """ Implements the Map Collapse pattern.
 
         Map-collapse takes two nested maps with M and N dimensions respectively,
@@ -33,9 +34,9 @@ class MapCollapse(pattern_matching.Transformation):
     @staticmethod
     def can_be_applied(graph, candidate, expr_index, sdfg, strict=False):
         # Check the edges between the entries of the two maps.
-        outer_map_entry = graph.nodes()[candidate[
+        outer_map_entry: nodes.MapEntry = graph.nodes()[candidate[
             MapCollapse._outer_map_entry]]
-        inner_map_entry = graph.nodes()[candidate[
+        inner_map_entry: nodes.MapEntry = graph.nodes()[candidate[
             MapCollapse._inner_map_entry]]
 
         # Check that inner map range is independent of outer range
@@ -83,14 +84,16 @@ class MapCollapse(pattern_matching.Transformation):
             if src != inner_map_exit:
                 return False
 
+        if strict:
+            if inner_map_entry.map.schedule != outer_map_entry.map.schedule:
+                return False
+
         return True
 
     @staticmethod
     def match_to_str(graph, candidate):
-        outer_map_entry = graph.nodes()[candidate[
-            MapCollapse._outer_map_entry]]
-        inner_map_entry = graph.nodes()[candidate[
-            MapCollapse._inner_map_entry]]
+        outer_map_entry = graph.nodes()[candidate[MapCollapse._outer_map_entry]]
+        inner_map_entry = graph.nodes()[candidate[MapCollapse._inner_map_entry]]
 
         return ' -> '.join(entry.map.label + ': ' + str(entry.map.params)
                            for entry in [outer_map_entry, inner_map_entry])

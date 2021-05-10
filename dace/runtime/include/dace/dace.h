@@ -1,3 +1,4 @@
+// Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 #ifndef __DACE_RUNTIME_H
 #define __DACE_RUNTIME_H
 
@@ -16,8 +17,8 @@
 #include "math.h"
 #include "complex.h"
 #include "pyinterop.h"
-#include "copy.h"
 #include "reduction.h"
+#include "copy.h"
 #include "stream.h"
 #include "os.h"
 #include "perf/reporting.h"
@@ -37,5 +38,7 @@
 #ifdef DACE_INTELFPGA
 #include "intel_fpga/host.h"
 #endif
+
+#include "fpga_common.h"
 
 #endif  // __DACE_RUNTIME_H

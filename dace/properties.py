@@ -1,3 +1,4 @@
+# Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 import ast
 from collections import OrderedDict
 import copy
@@ -12,6 +13,7 @@ import dace
 import dace.serialize
 from dace.symbolic import pystr_to_symbolic
 from dace.dtypes import DebugInfo
+from numbers import Integral, Number
 from typing import List, Set, Union
 
 ###############################################################################
@@ -227,8 +229,9 @@ class Property:
                     type(val).__name__, self.attr_name, self.dtype.__name__))
         # If the value has not yet been set, we cannot pass it to the enum
         # function. Fail silently if this happens
-        if self.choices is not None and isinstance(self.choices,
-                                                   (list, tuple, set)):
+        if self.choices is not None \
+                and isinstance(self.choices,(list, tuple, set)) \
+                and (val is not None or not self.allow_none):
             if val not in self.choices:
                 raise ValueError("Value {} not present in choices: {}".format(
                     val, self.choices))
@@ -412,7 +415,8 @@ def make_properties(cls):
         # Assert that there are no fields in the object not captured by
         # properties, unless they are prefixed with "_"
         for name, prop in obj.__dict__.items():
-            if name not in properties and not name.startswith("_"):
+            if (name not in properties and not name.startswith("_")
+                    and name not in dir(type(obj))):
                 raise PropertyError(
                     "{} : Variable {} is neither a Property nor "
                     "an internal variable (prefixed with \"_\")".format(
@@ -580,8 +584,8 @@ class TransformationHistProperty(Property):
             return data
         if not isinstance(data, list):
             raise TypeError(
-                'TransformationHistProperty expects a list input, got %s' % data
-            )
+                'TransformationHistProperty expects a list input, got %s' %
+                data)
         return [dace.serialize.from_json(elem) for elem in data]
 
 
@@ -665,7 +669,10 @@ class DictProperty(Property):
                 for k, v in saved_dictionary.items()
             }
 
-        return saved_dictionary
+        # Sort by key before saving
+        return {k: v
+                for k, v in sorted(saved_dictionary.items())
+                } if None not in saved_dictionary else saved_dictionary
 
     @staticmethod
     def from_string(s):
@@ -772,25 +779,25 @@ class DebugInfoProperty(Property):
         info_available = False
         di = None
 
-        m = re.search("file: (\w+)", s)
+        m = re.search(r"file: (\w+)", s)
         if m is not None:
             info_available = True
             f = sl = m.group(1)
-        m = re.search("from line: (\d+)", s)
+        m = re.search(r"from line: (\d+)", s)
         if m is not None:
             sl = m.group(1)
             el = sl
             info_available = True
-        m = re.search("to line: (\d+)", s)
+        m = re.search(r"to line: (\d+)", s)
         if m is not None:
             el = m.group(1)
             info_available = True
-        m = re.search("from col: (\d+)", s)
+        m = re.search(r"from col: (\d+)", s)
         if m is not None:
             sc = m.group(1)
             ec = sc
             info_available = True
-        m = re.search("to col: (\d+)", s)
+        m = re.search(r"to col: (\d+)", s)
         if m is not None:
             ec = m.group(1)
             info_available = True
@@ -842,7 +849,7 @@ class SetProperty(Property):
 
     @staticmethod
     def from_string(s):
-        return [eval(i) for i in re.sub("[\{\}\(\)\[\]]", "", s).split(",")]
+        return [eval(i) for i in re.sub(r"[\{\}\(\)\[\]]", "", s).split(",")]
 
     def to_json(self, l):
         return list(sorted(l))
@@ -910,8 +917,8 @@ class LambdaProperty(Property):
 
 
 class CodeBlock(object):
-    """ Helper class that represents code blocks with language. 
-        Used in `CodeProperty`, implemented as a list of AST statements if 
+    """ Helper class that represents code blocks with language.
+        Used in `CodeProperty`, implemented as a list of AST statements if
         language is Python, or a string otherwise.
     """
     def __init__(self,
@@ -935,7 +942,7 @@ class CodeBlock(object):
             self.code = code
 
     def get_free_symbols(self, defined_syms: Set[str] = None) -> Set[str]:
-        """ 
+        """
         Returns the set of free symbol names in this code block, excluding
         the given symbol names.
         """
@@ -952,7 +959,7 @@ class CodeBlock(object):
         return set()
 
     @property
-    def as_string(self):
+    def as_string(self) -> str:
         if isinstance(self.code, str) or self.code is None:
             return self.code
         return unparse(self.code)
@@ -993,6 +1000,8 @@ class CodeBlock(object):
             lang = dace.dtypes.Language.Python
         elif lang.endswith("CPP"):
             lang = dace.dtypes.Language.CPP
+        elif lang.endswith("sv") or lang.endswith("systemverilog"):
+            lang = dace.dtypes.Language.SystemVerilog
 
         try:
             cdata = tmp['string_data']
@@ -1042,6 +1051,8 @@ class CodeProperty(Property):
             lang = dace.dtypes.Language.Python
         elif lang.endswith("CPP"):
             lang = dace.dtypes.Language.CPP
+        elif lang.endswith("SystemVerilog"):
+            lang = dace.dtypes.Language.SystemVerilog
 
         try:
             cdata = tmp['string_data']
@@ -1125,12 +1136,11 @@ class SymbolicProperty(Property):
         return None
 
     def __set__(self, obj, val):
-        if (not isinstance(val, sp.expr.Expr) and not isinstance(val, int)
-                and not isinstance(val, str)):
-            raise TypeError(
-                "Property {} must an int or symbolic expression".format(
-                    self.attr_name))
-        if isinstance(val, (int, float, str, complex)):
+        if (val is not None and not isinstance(val, sp.Expr)
+                and not isinstance(val, Number) and not isinstance(val, str)):
+            raise TypeError(f"Property {self.attr_name} must be a literal "
+                            f"or symbolic expression, got: {type(val)}")
+        if isinstance(val, (Number, str)):
             val = SymbolicProperty.from_string(str(val))
 
         super(SymbolicProperty, self).__set__(obj, val)
@@ -1328,3 +1338,26 @@ class LibraryImplementationProperty(Property):
     """
     def typestring(self):
         return "LibraryImplementationProperty"
+
+
+class DataclassProperty(Property):
+    """
+    Property that stores pydantic models or dataclasses.
+    """
+    @staticmethod
+    def to_string(obj):
+        return str(obj)
+
+    @staticmethod
+    def from_string(s):
+        raise TypeError('Dataclasses cannot be loaded from a string, only JSON')
+
+    def to_json(self, obj):
+        if obj is None:
+            return None
+        return obj.dict()
+
+    def from_json(self, d, sdfg=None):
+        if d is None:
+            return None
+        return self.dtype.parse_obj(d)

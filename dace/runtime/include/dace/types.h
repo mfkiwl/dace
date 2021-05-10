@@ -1,3 +1,4 @@
+// Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 #ifndef __DACE_TYPES_H
 #define __DACE_TYPES_H
 
@@ -28,22 +29,24 @@
 // GPU support
 #ifdef __CUDACC__
     #include <cuda_runtime.h>
+    #include <cuda_fp16.h>
     #include <thrust/complex.h>
     #include "../../../external/cub/cub/grid/grid_barrier.cuh"
+
+    // Workaround so that half is defined as a scalar (for reductions)
+    namespace std {
+        template <>
+        struct is_scalar<half> : std::integral_constant<bool, true> {};
+    }  // namespace std
 #elif defined(__HIPCC__)
     #include <hip/hip_runtime.h>
+    #include <hip/hip_fp16.h>
 #endif
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
     #define DACE_HDFI __host__ __device__ __forceinline__
     #define DACE_HFI __host__ __forceinline__
     #define DACE_DFI __device__ __forceinline__
-    
-    // Workaround so that half is defined as a scalar (for reductions)
-    namespace std {
-        template <>
-        struct is_scalar<half> : std::integral_constant<bool, true> {};
-    }  // namespace std
 #else
     #define DACE_HDFI inline
     #define DACE_HFI inline
@@ -60,6 +63,7 @@
 
 namespace dace
 {
+    typedef bool bool_;
     typedef int8_t  int8;
     typedef int16_t int16;
     typedef int32_t int32;
