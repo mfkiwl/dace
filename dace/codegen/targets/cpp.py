@@ -366,6 +366,16 @@ def reshape_strides(subset, strides, original_strides, copy_shape):
     return reshaped_copy, new_strides
 
 
+def _is_c_contiguous(shape, strides):
+    """ 
+    Returns True if the strides represent a non-padded, C-contiguous (last 
+    dimension contiguous) array.
+    """
+    computed_strides = tuple(
+        data._prod(shape[i + 1:]) for i in range(len(shape)))
+    return tuple(strides) == computed_strides
+
+
 def ndcopy_to_strided_copy(
     copy_shape,
     src_shape,
@@ -416,8 +426,18 @@ def ndcopy_to_strided_copy(
         # Emit 1D copy of the whole array
         copy_shape = [functools.reduce(lambda x, y: x * y, copy_shape)]
         return copy_shape, [1], [1]
+    # Another case of non-strided 1D copy: all indices match and copy length
+    # matches pointer difference, as well as match in contiguity and padding
+    elif (first_src_index == first_dst_index
+          and last_src_index == last_dst_index and copy_length == src_copylen
+          and _is_c_contiguous(src_shape, src_strides)
+          and _is_c_contiguous(dst_shape, dst_strides)):
+        # Emit 1D copy of the whole array
+        copy_shape = [functools.reduce(lambda x, y: x * y, copy_shape)]
+        return copy_shape, [1], [1]
     # 1D strided copy
-    elif sum([0 if c == 1 else 1 for c in copy_shape]) == 1:
+    elif (sum([0 if c == 1 else 1 for c in copy_shape]) == 1
+          and len(src_subset) == len(dst_subset)):
         # Find the copied dimension:
         # In copy shape
         copydim = next(i for i, c in enumerate(copy_shape) if c != 1)
@@ -774,6 +794,19 @@ def unparse_tasklet(sdfg, state_id, dfg, node, function_stream, callsite_stream,
     if not node.code:
         return ""
 
+    # Not [], "" or None
+    if node.code_global and node.code_global.code:
+        function_stream.write(
+            codeblock_to_cpp(node.code_global),
+            sdfg,
+            state_id,
+            node,
+        )
+        function_stream.write("\n", sdfg, state_id, node)
+
+    # add node state_fields to the statestruct
+    codegen._frame.statestruct.extend(node.state_fields)
+
     # If raw C++ code, return the code directly
     if node.language != dtypes.Language.Python:
         # If this code runs on the host and is associated with a GPU stream,
@@ -801,13 +834,54 @@ def unparse_tasklet(sdfg, state_id, dfg, node, function_stream, callsite_stream,
                     node,
                 )
 
-        if node.language != dtypes.Language.CPP:
+        if node.language != dtypes.Language.CPP and node.language != dtypes.Language.MLIR:
             raise ValueError(
-                "Only Python or C++ code supported in CPU codegen, got: {}".
-                format(node.language))
-        callsite_stream.write(
-            type(node).__properties__["code"].to_string(node.code), sdfg,
-            state_id, node)
+                "Only Python, C++ or MLIR code supported in CPU codegen, got: {}"
+                .format(node.language))
+
+        if node.language == dtypes.Language.MLIR:
+            # Inline import because mlir.utils depends on pyMLIR which may not be installed
+            # Doesn't cause crashes due to missing pyMLIR if a MLIR tasklet is not present
+            from dace.codegen.targets.mlir import utils
+
+            mlir_func_uid = "_" + str(
+                sdfg.sdfg_id) + "_" + str(state_id) + "_" + str(
+                    dfg.node_id(node))
+
+            mlir_ast = utils.get_ast(node.code.code)
+            mlir_is_generic = utils.is_generic(mlir_ast)
+            mlir_entry_func = utils.get_entry_func(mlir_ast, mlir_is_generic,
+                                                   mlir_func_uid)
+
+            # Arguments of the MLIR must match the input connector names of the tasklet (the "%" excluded)
+            mlir_in_typed = ""
+            mlir_in_untyped = ""
+
+            for mlir_arg in utils.get_entry_args(mlir_entry_func,
+                                                 mlir_is_generic):
+                mlir_arg_name = mlir_arg[0]
+                mlir_arg_type = node.in_connectors[mlir_arg_name].ctype
+                mlir_in_typed = mlir_in_typed + mlir_arg_type + " " + mlir_arg_name + ", "
+                mlir_in_untyped = mlir_in_untyped + mlir_arg_name + ", "
+
+            mlir_in_typed = mlir_in_typed[:-2]
+            mlir_in_untyped = mlir_in_untyped[:-2]
+
+            mlir_out = next(iter(node.out_connectors.items()))
+            mlir_out_type = mlir_out[1].ctype
+            mlir_out_name = mlir_out[0]
+
+            # MLIR tools such as mlir-opt and mlir-translate as well as the LLVM compiler "lc" will be required to compile the MLIR tasklet
+            function_stream.write('extern "C" ' + mlir_out_type +
+                                  ' mlir_entry' + mlir_func_uid + '(' +
+                                  mlir_in_typed + ');\n\n')
+            callsite_stream.write(mlir_out_name + " = mlir_entry" +
+                                  mlir_func_uid + "(" + mlir_in_untyped + ");")
+
+        if node.language == dtypes.Language.CPP:
+            callsite_stream.write(
+                type(node).__properties__["code"].to_string(node.code), sdfg,
+                state_id, node)
 
         if hasattr(node, "_cuda_stream") and not is_devicelevel_gpu(
                 sdfg, state_dfg, node):
@@ -973,8 +1047,9 @@ class DaCeKeywordRemover(ExtNodeTransformer):
     def _subscript_expr(self, slicenode: ast.AST,
                         target: str) -> symbolic.SymbolicType:
         visited_slice = self.visit(slicenode)
-        if not isinstance(visited_slice, ast.Index):
-            raise NotImplementedError("Range subscripting not implemented")
+
+        if isinstance(visited_slice, ast.Index):
+            visited_slice = visited_slice.value
 
         # Collect strides for index expressions
         if target in self.constants:
@@ -995,15 +1070,15 @@ class DaCeKeywordRemover(ExtNodeTransformer):
                 and not (s == 1 and subset_size[i] == dimlen)
             ]
 
-        if isinstance(visited_slice.value, ast.Tuple):
-            if len(strides) != len(visited_slice.value.elts):
+        if isinstance(visited_slice, ast.Tuple):
+            if len(strides) != len(visited_slice.elts):
                 raise SyntaxError(
                     'Invalid number of dimensions in expression (expected %d, '
-                    'got %d)' % (len(strides), len(visited_slice.value.elts)))
+                    'got %d)' % (len(strides), len(visited_slice.elts)))
 
             return sum(
                 symbolic.pystr_to_symbolic(unparse(elt)) * s
-                for elt, s in zip(visited_slice.value.elts, strides))
+                for elt, s in zip(visited_slice.elts, strides))
 
         if len(strides) != 1:
             raise SyntaxError('Missing dimensions in expression (expected %d, '
@@ -1143,6 +1218,19 @@ class DaCeKeywordRemover(ExtNodeTransformer):
         # Do not parse internal functions
         return None
 
+    def visit_BinOp(self, node: ast.BinOp):
+        # Special case for integer powers
+        if isinstance(node.op, ast.Pow):
+            try:
+                unparsed = symbolic.pystr_to_symbolic(unparse(node.right))
+                evaluated = symbolic.symstr(
+                    symbolic.evaluate(unparsed, self.constants))
+                node.right = ast.parse(evaluated).body[0].value
+            except (TypeError, AttributeError, NameError, KeyError, ValueError):
+                return self.generic_visit(node)
+
+        return self.generic_visit(node)
+
     # Replace default modules (e.g., math) with dace::math::
     def visit_Attribute(self, node):
         attrname = rname(node)
@@ -1235,8 +1323,13 @@ def synchronize_streams(sdfg, dfg, state_id, node, scope_exit, callsite_stream):
                 )
                 continue
 
+            # If a view, get the relevant access node
+            dstnode = edge.dst
+            while isinstance(sdfg.arrays[dstnode.data], data.View):
+                dstnode = dfg.out_edges(dstnode)[0].dst
+
             # We need the streams leading out of the output data
-            for e in dfg.out_edges(edge.dst):
+            for e in dfg.out_edges(dstnode):
                 if isinstance(e.dst, nodes.AccessNode):
                     continue
                 # If no stream at destination: synchronize stream with host.

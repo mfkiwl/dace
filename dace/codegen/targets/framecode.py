@@ -360,10 +360,10 @@ DACE_EXPORTED void __dace_exit_{sdfg.name}({sdfg.name}_t *__state)
                                                callsite_stream,
                                                skip_entry_node=False)
         else:
-            if config.Config.get_bool('compiler', 'cpu', 'openmp_sections'):
+            if sdfg.openmp_sections:
                 callsite_stream.write("#pragma omp parallel sections\n{")
             for c in components:
-                if config.Config.get_bool('compiler', 'cpu', 'openmp_sections'):
+                if sdfg.openmp_sections:
                     callsite_stream.write("#pragma omp section\n{")
                 self._dispatcher.dispatch_subgraph(sdfg,
                                                    c,
@@ -371,9 +371,9 @@ DACE_EXPORTED void __dace_exit_{sdfg.name}({sdfg.name}_t *__state)
                                                    global_stream,
                                                    callsite_stream,
                                                    skip_entry_node=False)
-                if config.Config.get_bool('compiler', 'cpu', 'openmp_sections'):
+                if sdfg.openmp_sections:
                     callsite_stream.write("} // End omp section")
-            if config.Config.get_bool('compiler', 'cpu', 'openmp_sections'):
+            if sdfg.openmp_sections:
                 callsite_stream.write("} // End omp sections")
 
         #####################
@@ -457,7 +457,7 @@ DACE_EXPORTED void __dace_exit_{sdfg.name}({sdfg.name}_t *__state)
             cft = cflow.GeneralBlock(dispatch_state, [
                 cflow.SingleState(dispatch_state, s, s is last)
                 for s in states_topological
-            ], [])
+            ], [], [])
 
         callsite_stream.write(
             cft.as_cpp(self.dispatcher.defined_vars, sdfg.symbols), sdfg)

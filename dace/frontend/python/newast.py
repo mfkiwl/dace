@@ -6,12 +6,14 @@ import copy
 import itertools
 import re
 import sys
+from os import path
 import warnings
 from numbers import Number
 from typing import Any, Dict, List, Set, Tuple, Union, Callable, Optional
 
 import dace
 from dace import data, dtypes, subsets, symbolic, sdfg as sd
+from dace import sourcemap
 from dace.config import Config
 from dace.frontend.common import op_repository as oprepo
 from dace.frontend.python import astutils
@@ -34,7 +36,7 @@ import sympy
 
 # register replacements in oprepo
 import dace.frontend.python.replacements
-from dace.frontend.python.replacements import _sym_type
+from dace.frontend.python.replacements import _sym_type, _broadcast_to
 
 # Type hints
 Size = Union[int, dace.symbolic.symbol]
@@ -166,10 +168,20 @@ def parse_dace_program(f,
 
     # Resolve constants to their values (if they are not already defined in this scope)
     # and symbols to their names
-    src_ast = GlobalResolver({
+    resolved = {
         k: v
-        for k, v in global_vars.items() if not k in argtypes and k != '_'
-    }).visit(src_ast)
+        for k, v in global_vars.items() if k not in argtypes and k != '_'
+    }
+    src_ast = GlobalResolver(resolved).visit(src_ast)
+    src_ast = ConditionalCodeResolver(resolved).visit(src_ast)
+    src_ast = DeadCodeEliminator().visit(src_ast)
+
+    # Filter remaining global variables according to type and scoping rules
+    global_vars = {
+        k: v
+        for k, v in global_vars.items()
+        if k not in argtypes  #and dtypes.isallowed(v)
+    }
 
     pv = ProgramVisitor(name=name,
                         filename=src_file,
@@ -184,6 +196,19 @@ def parse_dace_program(f,
 
     sdfg, _, _, _ = pv.parse_program(src_ast.body[0])
     sdfg.set_sourcecode(src, 'python')
+
+    # We save information in a tmp file for improved source mapping.
+    # In the case of the cache config set to 'hash' we don't create a mapping.
+    if Config.get('cache') != 'hash':
+        other_functions = [func for func in other_sdfgs if not func == name]
+        data = {
+            "start_line": src_line + 1,
+            "end_line": src_line + len(src.split("\n")) - 1,
+            "src_file": path.abspath(src_file),
+            "other_sdfgs": other_functions,
+            "build_folder": sdfg.build_folder,
+        }
+        sourcemap.temporaryInfo(name, data)
 
     return sdfg
 
@@ -240,13 +265,102 @@ class ModuleResolver(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+class RewriteSympyEquality(ast.NodeTransformer):
+    """ 
+    Replaces symbolic equality checks by ``sympy.{Eq,Ne}``. 
+    This is done because a test ``if x == 0`` where ``x`` is a symbol would
+    result in False, even in indeterminate cases.
+    """
+    def __init__(self, globals: Dict[str, Any]) -> None:
+        super().__init__()
+        self.globals = globals
+
+    def visit_Compare(self, node: ast.Compare) -> Any:
+        if len(node.comparators) != 1:
+            return self.generic_visit(node)
+        left = astutils.evalnode(self.visit(node.left), self.globals)
+        right = astutils.evalnode(self.visit(node.comparators[0]), self.globals)
+        if (isinstance(left, sympy.Basic) or isinstance(right, sympy.Basic)):
+            if isinstance(node.ops[0], ast.Eq):
+                return sympy.Eq(left, right)
+            elif isinstance(node.ops[0], ast.NotEq):
+                return sympy.Ne(left, right)
+        return self.generic_visit(node)
+
+
+class ConditionalCodeResolver(ast.NodeTransformer):
+    """ 
+    Replaces if conditions by their bodies if can be evaluated at compile time.
+    """
+    def __init__(self, globals: Dict[str, Any]):
+        super().__init__()
+        self.globals = globals
+
+    def visit_If(self, node: ast.If) -> Any:
+        try:
+            test = RewriteSympyEquality(self.globals).visit(node.test)
+            result = astutils.evalnode(test, self.globals)
+
+            if (result is True
+                    or (isinstance(result, sympy.Basic) and result == True)):
+                # Only return "if" body
+                return node.body
+            elif (result is False
+                  or (isinstance(result, sympy.Basic) and result == False)):
+                # Only return "else" body
+                return node.orelse
+            # Any other case is indeterminate, fall back to generic visit
+        except SyntaxError:
+            # Cannot evaluate if condition at compile time
+            pass
+
+        return self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> Any:
+        return self.visit_If(node)
+
+
+class DeadCodeEliminator(ast.NodeTransformer):
+    """ Removes any code within scope after return/break/continue/raise. """
+    def generic_visit(self, node: ast.AST):
+        for field, old_value in ast.iter_fields(node):
+            if isinstance(old_value, list):
+                # Scope fields
+                scope_field = field in ('body', 'orelse')
+
+                new_values = []
+                for value in old_value:
+                    if isinstance(value, ast.AST):
+                        value = self.visit(value)
+                        if value is None:
+                            continue
+                        elif not isinstance(value, ast.AST):
+                            new_values.extend(value)
+                            continue
+                        elif (scope_field and isinstance(
+                                value,
+                            (ast.Return, ast.Break, ast.Continue, ast.Raise))):
+                            # Any AST node after this one is unreachable and
+                            # not parsed by this transformer
+                            new_values.append(value)
+                            break
+                    new_values.append(value)
+                old_value[:] = new_values
+            elif isinstance(old_value, ast.AST):
+                new_node = self.visit(old_value)
+                if new_node is None:
+                    delattr(node, field)
+                else:
+                    setattr(node, field, new_node)
+        return node
+
+
 # AST node types that are disallowed in DaCe programs
 _DISALLOWED_STMTS = [
-    'Global', 'Delete', 'Import', 'ImportFrom', 'Assert', 'Pass', 'Exec',
-    'Print', 'Nonlocal', 'Yield', 'YieldFrom', 'Raise', 'Try', 'TryExcept',
-    'TryFinally', 'ExceptHandler', 'Starred', 'ClassDef', 'AsyncFor', 'Await',
-    'Bytes', 'Set', 'Dict', 'ListComp', 'GeneratorExp', 'SetComp', 'DictComp',
-    'comprehension'
+    'Global', 'Delete', 'Import', 'ImportFrom', 'Assert', 'Exec', 'Print',
+    'Nonlocal', 'Yield', 'YieldFrom', 'Raise', 'Try', 'TryExcept', 'TryFinally',
+    'ExceptHandler', 'Starred', 'ClassDef', 'AsyncFor', 'Await', 'Bytes', 'Set',
+    'Dict', 'ListComp', 'GeneratorExp', 'SetComp', 'DictComp', 'comprehension'
 ]
 
 TaskletType = Union[ast.FunctionDef, ast.With, ast.For]
@@ -381,16 +495,11 @@ def add_indirection_subgraph(sdfg: SDFG,
         for i, r in enumerate(memlet.subset):
             if i in nonsqz_dims:
                 mapped_rng.append(r)
-        ind_entry, ind_exit = graph.add_map(
-            'indirection',
-            {
-                # NOTE: Experimental (original code below)
-                '__i%d' % i: '%s:%s+1:%s' % (s, e, t)
-                for i, (s, e, t) in enumerate(mapped_rng)
-                #     '__i%d' % i: '%s:%s+1:%s' % (s, e, t)
-                # for i, (s, e, t) in enumerate(rng)
-            },
-            debuginfo=pvisitor.current_lineinfo)
+        ind_entry, ind_exit = graph.add_map('indirection', {
+            '__i%d' % i: '%s:%s+1:%s' % (s, e, t)
+            for i, (s, e, t) in enumerate(mapped_rng)
+        },
+                                            debuginfo=pvisitor.current_lineinfo)
         inp_base_path.insert(0, ind_entry)
         out_base_path.append(ind_exit)
 
@@ -508,8 +617,6 @@ def add_indirection_subgraph(sdfg: SDFG,
     tmp_shape = storage.shape
     indirectRange = subsets.Range([(0, s - 1, 1) for s in tmp_shape])
     if ind_entry:  # Amend indirected range
-        # indirectRange = ','.join([ind for ind in ind_entry.map.params])
-        # NOTE: Experimental (original code above)
         indirectRange = ','.join([
             "{} - {}".format(ind, r[0])
             for ind, r in zip(ind_entry.map.params, mapped_rng)
@@ -633,10 +740,11 @@ class GlobalResolver(ast.NodeTransformer):
                 return None
             newnode = ast.Tuple(elts=elts, ctx=parent_node.ctx)
         elif isinstance(value, symbolic.symbol):
-            # symbols resolve to the symbol name
+            # Symbols resolve to the symbol name
             newnode = ast.Name(id=value.name, ctx=ast.Load())
-        elif dtypes.isconstant(value):
-            # otherwise we must have a non list or tuple constant; emit a constant node
+        elif (dtypes.isconstant(value) or isinstance(value, SDFG)
+              or hasattr(value, '__sdfg__')):
+            # Could be a constant, an SDFG, or SDFG-convertible object
 
             # Compatibility check since Python changed their AST nodes
             if sys.version_info >= (3, 8):
@@ -677,20 +785,61 @@ class GlobalResolver(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
-        # TODO(later): Support more levels of modules (mod.mod2.mod3.value)
-        if (isinstance(node.value, ast.Name)
-                and isinstance(node.value.ctx, ast.Load)
-                and node.value.id in self.globals
-                and hasattr(self.globals[node.value.id], node.attr)):
-            global_val = getattr(self.globals[node.value.id], node.attr)
-            # TODO: Without this check, dace dtypes do not serialize well
-            if not isinstance(global_val, dtypes.typeclass):
-                newnode = self.global_value_to_node(global_val,
-                                                    parent_node=node,
-                                                    recurse=True)
-                if newnode is not None:
-                    return newnode
+        # Try to evaluate the expression with only the globals
+        try:
+            global_val = astutils.evalnode(node, self.globals)
+        except SyntaxError:
+            return self.generic_visit(node)
+
+        # global_val = getattr(self.globals[node.value.id], node.attr)
+        # TODO: Without this check, dace dtypes do not serialize well
+        if not isinstance(global_val, dtypes.typeclass):
+            newnode = self.global_value_to_node(global_val,
+                                                parent_node=node,
+                                                recurse=True)
+            if newnode is not None:
+                return newnode
         return self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        try:
+            global_func = astutils.evalnode(node.func, self.globals)
+            global_val = astutils.evalnode(node, self.globals)
+        except SyntaxError:
+            return self.generic_visit(node)
+
+        # Without this check, casts don't generate code
+        if (not isinstance(global_val, dtypes.typeclass)
+                and not isinstance(global_func, dtypes.typeclass)):
+            newnode = self.global_value_to_node(global_val,
+                                                parent_node=node,
+                                                recurse=True)
+            if newnode is not None:
+                return newnode
+        return self.generic_visit(node)
+
+    def visit_Assert(self, node: ast.Assert) -> Any:
+        # Try to evaluate assertion statically
+        try:
+            global_val = astutils.evalnode(node.test, self.globals)
+            if global_val:  # Check condition the same way as assert does
+                return None
+            try:
+                msg = astutils.evalnode(node.msg, self.globals)
+                if msg is not None:
+                    msg = '. Message: ' + msg
+                else:
+                    msg = '.'
+            except SyntaxError:
+                msg = ' (ERROR: could not statically evaluate message).'
+
+            raise AssertionError('Assertion failed statically at line '
+                                 f'{node.lineno} during compilation of DaCe '
+                                 'program' + msg)
+        except SyntaxError:
+            warnings.warn(f'Runtime assertion at line {node.lineno} could not'
+                          ' be checked in DaCe program, skipping check.')
+        return None
 
 
 class TaskletTransformer(ExtNodeTransformer):
@@ -702,7 +851,7 @@ class TaskletTransformer(ExtNodeTransformer):
                  sdfg: SDFG,
                  state: SDFGState,
                  filename: str,
-                 lang=dtypes.Language.Python,
+                 lang=None,
                  location: dict = {},
                  nested: bool = False,
                  scope_arrays: Dict[str, data.Data] = dict(),
@@ -728,6 +877,9 @@ class TaskletTransformer(ExtNodeTransformer):
 
         self.extcode = None
         self.lang = lang
+        self.globalcode = ''
+        self.initcode = ''
+        self.exitcode = ''
         self.location = location
 
         self.nested = nested
@@ -771,11 +923,17 @@ class TaskletTransformer(ExtNodeTransformer):
             name = getattr(tasklet_ast, 'name',
                            'tasklet_%d' % tasklet_ast.lineno)
 
+        if self.lang is None:
+            self.lang = dtypes.Language.Python
+
         t = self.state.add_tasklet(name,
                                    set(self.inputs.keys()),
                                    set(self.outputs.keys()),
                                    self.extcode or tasklet_ast.body,
                                    language=self.lang,
+                                   code_global=self.globalcode,
+                                   code_init=self.initcode,
+                                   code_exit=self.exitcode,
                                    location=self.location,
                                    debuginfo=locinfo)
 
@@ -1074,8 +1232,10 @@ class TaskletTransformer(ExtNodeTransformer):
                 'Cannot provide more than one intrinsic implementation ' +
                 'for tasklet')
         self.extcode = node.s
-        # TODO(later): Syntax for other languages?
-        self.lang = dtypes.Language.CPP
+
+        # TODO: Should get detected by _parse_Tasklet()
+        if self.lang is None:
+            self.lang = dtypes.Language.CPP
 
         return node
 
@@ -1434,7 +1594,14 @@ class ProgramVisitor(ExtNodeVisitor):
                 result[name] = symbolic.symbol(name, dtype=val)
             else:
                 values = str(val).split(':')
-                if len(values) == 2:
+                if len(values) == 1:
+                    result[name] = symbolic.symbol(
+                        name,
+                        infer_expr_type(values[0], {
+                            **self.globals,
+                            **dyn_inputs
+                        }))
+                elif len(values) == 2:
                     result[name] = symbolic.symbol(
                         name,
                         dtypes.result_type_of(
@@ -1446,13 +1613,18 @@ class ProgramVisitor(ExtNodeVisitor):
                                 **self.globals,
                                 **dyn_inputs
                             })))
-                else:
+                elif len(values) == 3:
                     result[name] = symbolic.symbol(
                         name,
                         infer_expr_type(values[0], {
                             **self.globals,
                             **dyn_inputs
                         }))
+                else:
+                    raise DaceSyntaxError(
+                        self, None,
+                        "Invalid number of arguments in a range iterator. "
+                        "You may use up to 3 arguments (start:stop:step).")
 
         return result
 
@@ -1659,7 +1831,7 @@ class ProgramVisitor(ExtNodeVisitor):
         elif isinstance(node, ast.Constant):
             return str(node.value)
         else:
-            return str(pyexpr_to_symbolic(self.defined, node))
+            return str(self.visit(node))
 
     def _parse_slice(self, node: ast.Slice):
         """Parses a range
@@ -1674,17 +1846,18 @@ class ProgramVisitor(ExtNodeVisitor):
         return (self._parse_value(node.lower), self._parse_value(node.upper),
                 self._parse_value(node.step) if node.step is not None else "1")
 
-    def _parse_index_as_range(self, node: ast.Index):
-        """Parses an index as range
-
-        Arguments:
-            node {ast.Index} -- Index node
-
-        Returns:
-            Tuple[str] -- Range in (from, to, step) format
+    def _parse_index_as_range(self, node: Union[ast.Index, ast.Tuple]):
         """
-
-        val = self._parse_value(node.value)
+        Parses an index as range
+        :param node: Index node
+        :return: Range in (from, to, step) format
+        """
+        if isinstance(node, ast.Index):
+            val = self._parse_value(node.value)
+        elif isinstance(node, ast.Tuple):
+            val = self._parse_value(node.elts)
+        else:
+            val = self._parse_value(node)
         return (val, val, "1")
 
     def _parse_for_iterator(self, node: ast.Expr):
@@ -1721,18 +1894,26 @@ class ProgramVisitor(ExtNodeVisitor):
             zero = ast.parse('0').body[0]
             one = ast.parse('1').body[0]
 
+            def visit_ast_or_value(arg):
+                ast_res = self._visit_ast_or_value(arg)
+                val_res = self._parse_value(ast_res)
+                return val_res, ast_res
+
             if len(node.args) == 1:  # (par)range(stop)
-                ranges = [('0', self._parse_value(node.args[0]), '1')]
-                ast_ranges = [(zero, node.args[0], one)]
+                valr, astr = visit_ast_or_value(node.args[0])
+                ranges = [('0', valr, '1')]
+                ast_ranges = [(zero, astr, one)]
             elif len(node.args) == 2:  # (par)range(start, stop)
-                ranges = [(self._parse_value(node.args[0]),
-                           self._parse_value(node.args[1]), '1')]
-                ast_ranges = [(node.args[0], node.args[1], one)]
+                valr0, astr0 = visit_ast_or_value(node.args[0])
+                valr1, astr1 = visit_ast_or_value(node.args[1])
+                ranges = [(valr0, valr1, '1')]
+                ast_ranges = [(astr0, astr1, one)]
             elif len(node.args) == 3:  # (par)range(start, stop, step)
-                ranges = [(self._parse_value(node.args[0]),
-                           self._parse_value(node.args[1]),
-                           self._parse_value(node.args[2]))]
-                ast_ranges = [(node.args[0], node.args[1], node.args[2])]
+                valr0, astr0 = visit_ast_or_value(node.args[0])
+                valr1, astr1 = visit_ast_or_value(node.args[1])
+                valr2, astr2 = visit_ast_or_value(node.args[2])
+                ranges = [(valr0, valr1, valr2)]
+                ast_ranges = [(astr0, astr1, astr2)]
             else:
                 raise DaceSyntaxError(
                     self, node,
@@ -1741,7 +1922,7 @@ class ProgramVisitor(ExtNodeVisitor):
                 iterator = 'dace.map'
         else:
             ranges = []
-            if isinstance(node.slice, ast.ExtSlice):
+            if isinstance(node.slice, (ast.Tuple, ast.ExtSlice)):
                 for s in node.slice.dims:
                     ranges.append(self._parse_slice(s))
             elif isinstance(node.slice, ast.Slice):
@@ -1909,7 +2090,10 @@ class ProgramVisitor(ExtNodeVisitor):
                         raise SyntaxError('Cannot determine connector type for '
                                           'tasklet input dependency')
                     self.sdfg.add_scalar(new_scalar, dtype, transient=True)
-                    state.add_edge(v, conn, internal_node, conn,
+                    accessnode = state.add_access(new_scalar)
+                    state.add_edge(v, conn, accessnode, None,
+                                   dace.Memlet.simple(new_scalar, '0'))
+                    state.add_edge(accessnode, None, internal_node, conn,
                                    dace.Memlet.simple(new_scalar, '0'))
                     if entry_node is not None:
                         state.add_edge(entry_node, None, v, None, dace.Memlet())
@@ -2204,7 +2388,8 @@ class ProgramVisitor(ExtNodeVisitor):
 
         if iterator == 'dace.map':
             state = self._add_state('MapState')
-            params = [(k, ':'.join(v)) for k, v in zip(indices, ranges)]
+            params = [(k, ':'.join([str(t) for t in v]))
+                      for k, v in zip(indices, ranges)]
             params, map_inputs = self._parse_map_inputs('map_%d' % node.lineno,
                                                         params, node)
             me, mx = state.add_map(name='%s_%d' % (self.name, node.lineno),
@@ -2290,7 +2475,8 @@ class ProgramVisitor(ExtNodeVisitor):
                                 self, node, 'Undefined variable "%s"' % atom)
                         # Add to global SDFG symbols if not a scalar
                         if (astr not in self.sdfg.symbols
-                                and astr not in self.variables):
+                                and not (astr in self.variables
+                                         or astr in self.sdfg.arrays)):
                             self.sdfg.add_symbol(astr, atom.dtype)
 
             # Add an initial loop state with a None last_state (so as to not
@@ -2484,10 +2670,26 @@ class ProgramVisitor(ExtNodeVisitor):
                                dace.InterstateEdge(cond_else))
 
     def _parse_tasklet(self, state: SDFGState, node: TaskletType, name=None):
+
+        # Looking for the first argument in a tasklet annotation: @dace.tasklet(STRING HERE)
+        langInf = None
+        if isinstance(node, ast.FunctionDef) and \
+            hasattr(node, 'decorator_list') and \
+            isinstance(node.decorator_list, list) and \
+            len(node.decorator_list) > 0 and \
+            hasattr(node.decorator_list[0], 'args') and \
+            isinstance(node.decorator_list[0].args, list) and \
+            len(node.decorator_list[0].args) > 0 and \
+            hasattr(node.decorator_list[0].args[0], 'value'):
+
+            langArg = node.decorator_list[0].args[0].value
+            langInf = dtypes.Language[langArg]
+
         ttrans = TaskletTransformer(self.defined,
                                     self.sdfg,
                                     state,
                                     self.filename,
+                                    lang=langInf,
                                     nested=self.nested,
                                     scope_arrays=self.scope_arrays,
                                     scope_vars=self.scope_vars,
@@ -2564,14 +2766,42 @@ class ProgramVisitor(ExtNodeVisitor):
 
         if target_subset.num_elements() != 1:
             if op_subset.num_elements() != 1:
-                if target_subset.size() == op_subset.size() and op:
-                    inp_subset = copy.deepcopy(op_subset)
-                    inp_subset.offset(target_subset, True)
+                squeezed = copy.deepcopy(target_subset)
+                squeezed.squeeze(offset=False)
+                squeezed_op = copy.deepcopy(op_subset)
+                squeezed_op.squeeze(offset=False)
+                if squeezed.size() != squeezed_op.size() or op:
+
+                    _, all_idx_tuples, _, _, inp_idx = _broadcast_to(
+                        squeezed.size(), op_subset.size())
+
+                    idx = iter(i for i, _ in all_idx_tuples)
+                    target_index = ','.join(
+                        next(idx) if size != 1 else str(target_subset.
+                                                        ranges[i][0])
+                        for i, size in enumerate(target_subset.size()))
+
+                    inp_idx = inp_idx.split(',')
+                    # create a fake subset that would be the input subset broadcasted to the correct size
+                    missing_dimensions = squeezed.ranges[:len(all_idx_tuples) -
+                                                         len(inp_idx)]
+                    op_dimensions = op_subset.ranges
+
+                    fake_subset = dace.subsets.Range(missing_dimensions +
+                                                     op_dimensions)
+
+                    # use this fake subset to calculate the offset
+                    fake_subset.offset(squeezed, True)
+
+                    # we access the inp subset using the computed offset
+                    # since the inp_subset may be missing leading dimensions, we reverse-zip-reverse
+                    idx_and_subset = reversed(
+                        list(zip(reversed(inp_idx), reversed(fake_subset))))
+
                     inp_memlet = Memlet("{a}[{s}]".format(
                         a=op_name,
                         s=','.join([
-                            '__i%d + %d' % (i, s)
-                            for i, (s, _, _) in enumerate(inp_subset)
+                            f'{idx} + {s}' for idx, (s, _, _) in idx_and_subset
                         ])))
                     out_memlet = Memlet("{a}[{s}]".format(a=target_name,
                                                           s=target_index))
@@ -2586,7 +2816,7 @@ class ProgramVisitor(ExtNodeVisitor):
                     tasklet_code += '__out = __inp'
                     state.add_mapped_tasklet(state.label, {
                         '__i%d' % i: '%s:%s+1:%s' % (start, end, step)
-                        for i, (start, end, step) in enumerate(target_subset)
+                        for i, (start, end, step) in enumerate(squeezed)
                     }, {
                         '__inp': inp_memlet,
                         **input_memlets
@@ -2595,6 +2825,7 @@ class ProgramVisitor(ExtNodeVisitor):
                                              {'__out': out_memlet},
                                              external_edges=True,
                                              debuginfo=self.current_lineinfo)
+
                 else:
                     if boolarr is not None:
                         raise NotImplementedError
@@ -2968,6 +3199,7 @@ class ProgramVisitor(ExtNodeVisitor):
                 self.outputs[var_name] = (dace.Memlet.simple(parent_name, rng),
                                           inner_indices)
 
+        self.variables[var_name] = var_name
         return (var_name, squeezed_rng)
 
     def _add_read_access(self,
@@ -3165,13 +3397,13 @@ class ProgramVisitor(ExtNodeVisitor):
                                     boolarr = arr
                             elif arr in self.sdfg.constants:
                                 desc = self.sdfg.constants[arr]
-                                if desc.dtype == numpy.bool:
+                                if desc.dtype == numpy.bool_:
                                     boolarr = arr
                             else:
                                 raise IndexError(
                                     f'Array index "{arr}" undefined')
                         elif isinstance(arr, (list, tuple)):
-                            if numpy.array(arr).dtype == numpy.bool:
+                            if numpy.array(arr).dtype == numpy.bool_:
                                 carr = numpy.array(
                                     arrname, dtype=dtypes.typeclass(int).type)
                                 cname = self.sdfg.find_new_constant(
@@ -3405,37 +3637,78 @@ class ProgramVisitor(ExtNodeVisitor):
                     if state.in_degree(node) > 0:
                         return True
 
+    def _get_sdfg(self, value: Any, args: Tuple[Any],
+                  kwargs: Dict[str, Any]) -> SDFG:
+        if isinstance(value, SDFG):  # Already an SDFG
+            return value
+        if hasattr(value, '__sdfg__'):  # Object that can be converted to SDFG
+            return value.__sdfg__(*args, **kwargs)
+        return None
+
+    def _has_sdfg(self, value: Any) -> bool:
+        return isinstance(value, SDFG) or hasattr(value, '__sdfg__')
+
+    def _eval_arg(self, arg: Union[str, Any]) -> Any:
+        if not isinstance(arg, str):
+            return arg
+        if arg in self.defined:
+            return self.defined[arg]
+        if arg in self.sdfg.arrays:
+            return self.sdfg.arrays[arg]
+        if arg in self.sdfg.symbols:
+            return self.sdfg.symbols[arg]
+        return arg
+
     def visit_Call(self, node: ast.Call):
-        from dace.frontend.python.parser import DaceProgram  # Avoiding import loop
-
-        funcname = rname(node)
         func = None
+        # If the call directly refers to an SDFG or dace-compatible program
+        if isinstance(node.func, ast.Num):
+            if self._has_sdfg(node.func.n):
+                func = node.func.n
+        elif isinstance(node.func, ast.Constant):
+            if self._has_sdfg(node.func.value):
+                func = node.func.value
 
-        # Check if the function exists as an SDFG in a different module
-        modname = until(funcname, '.')
-        if ('.' in funcname and len(modname) > 0 and modname in self.globals
-                and dtypes.ismodule(self.globals[modname])):
-            try:
-                func = getattr(self.globals[modname],
-                               funcname[len(modname) + 1:])
-            except AttributeError:
-                func = None
+        if func is None:
+            funcname = rname(node)
+            # Check if the function exists as an SDFG in a different module
+            modname = until(funcname, '.')
+            if ('.' in funcname and len(modname) > 0 and modname in self.globals
+                    and dtypes.ismodule(self.globals[modname])):
+                try:
+                    func = getattr(self.globals[modname],
+                                   funcname[len(modname) + 1:])
+                except AttributeError:
+                    func = None
 
-            # Not an SDFG, ignore (might be a recognized function, see below)
-            if not isinstance(func, (SDFG, DaceProgram)):
-                func = None
-            else:
-                # An SDFG, replace dots in name with underscores
-                funcname = funcname.replace('.', '_')
+                # Not an SDFG, ignore (might be a recognized function, see below)
+                if not self._has_sdfg(func):
+                    func = None
+                else:
+                    # An SDFG, replace dots in name with underscores
+                    funcname = funcname.replace('.', '_')
+
+            # If the function is a callable object
+            elif funcname in self.globals and callable(self.globals[funcname]):
+                fcall = getattr(self.globals[funcname], '__call__', False)
+                if self._has_sdfg(fcall):
+                    func = fcall
+                    funcname = fcall.name
 
         # If the function exists as a global SDFG or @dace.program, use it
         if func or funcname in self.other_sdfgs:
+            # Avoid import loops
+            from dace.frontend.python.parser import DaceProgram
+
             if func is None:
                 func = self.other_sdfgs[funcname]
             if isinstance(func, SDFG):
                 sdfg = copy.deepcopy(func)
-                args = [(arg.arg, self._parse_function_arg(arg.value))
-                        for arg in node.keywords]
+                funcname = sdfg.name
+                args = [(aname, self._parse_function_arg(arg))
+                        for aname, arg in zip(sdfg.arg_names, node.args)]
+                args += [(arg.arg, self._parse_function_arg(arg.value))
+                         for arg in node.keywords]
                 required_args = [
                     a for a in sdfg.arglist().keys() if a not in sdfg.symbols
                 ]
@@ -3446,29 +3719,42 @@ class ProgramVisitor(ExtNodeVisitor):
                          for arg in node.keywords]
                 required_args = func.argnames
 
-                sdfg = copy.deepcopy(
-                    func.to_sdfg(*({
-                        **self.defined,
-                        **self.sdfg.arrays,
-                        **self.sdfg.symbols
-                    }[arg] if isinstance(arg, str) else arg
-                                   for aname, arg in args),
-                                 strict=self.strict,
-                                 save=False))
-
+                fcopy = copy.copy(func)
+                funcname = func.name
+                fcopy._cache = (None, None, None)
+                fcopy.global_vars = {**func.global_vars, **self.globals}
+                fargs = (self._eval_arg(arg) for _, arg in args)
+                sdfg = fcopy.to_sdfg(*fargs, strict=self.strict, save=False)
+            elif self._has_sdfg(func):
+                fargs = tuple(
+                    self._eval_arg(self._parse_function_arg(arg))
+                    for arg in node.args)
+                fkwargs = {
+                    arg.arg: self._eval_arg(self._parse_function_arg(arg.value))
+                    for arg in node.keywords
+                }
+                sdfg = copy.deepcopy(self._get_sdfg(func, fargs, fkwargs))
+                funcname = sdfg.name
+                args = [(aname, self._parse_function_arg(arg))
+                        for aname, arg in zip(sdfg.arg_names, node.args)]
+                args += [(arg.arg, self._parse_function_arg(arg.value))
+                         for arg in node.keywords]
+                required_args = [
+                    a for a in sdfg.arglist().keys() if a not in sdfg.symbols
+                ]
             else:
                 raise DaceSyntaxError(
                     self, node, 'Unrecognized SDFG type "%s" in call to "%s"' %
                     (type(func).__name__, funcname))
 
             # Avoid import loops
-            from dace.frontend.python.parser import infer_symbols_from_shapes
+            from dace.frontend.python.parser import infer_symbols_from_datadescriptor
 
             # Map internal SDFG symbols by adding keyword arguments
             # symbols = set(sdfg.symbols.keys())
             symbols = sdfg.free_symbols
             try:
-                mapping = infer_symbols_from_shapes(
+                mapping = infer_symbols_from_datadescriptor(
                     sdfg, {
                         k: self.sdfg.arrays[v]
                         for k, v in args if v in self.sdfg.arrays
@@ -3655,8 +3941,10 @@ class ProgramVisitor(ExtNodeVisitor):
 
             # Add return values as additional outputs
             rets = []
+            given_args = set(a for a, _ in args)
             for arrname, arr in sdfg.arrays.items():
-                if arrname.startswith('__return') and not arr.transient:
+                if (arrname.startswith('__return') and not arr.transient
+                        and arrname not in given_args):
                     # Add a transient to the current SDFG
                     new_arrname = '%s_ret_%d' % (sdfg.name, len(rets))
                     newarr = copy.deepcopy(arr)
@@ -3769,7 +4057,38 @@ class ProgramVisitor(ExtNodeVisitor):
                     self, node, 'Function "%s" is not registered with an SDFG '
                     'implementation' % funcname)
 
-        args.extend([self._parse_function_arg(arg) for arg in node.args])
+        # NOTE: Temporary fix for MPI library-node replacements
+        # Parsing the arguments with `_parse_function_arg` will generate
+        # slices even for the output arguments.
+        # We make a special exception for MPI calls (`dace.comm` namespace)
+        # and we pass instead the array names and the ranges accessed.
+        # The replacement functions are responsible for generating the correct
+        # subgraph/memlets.
+        if funcname.startswith("dace.comm"):
+            mpi_args = []
+            for arg in node.args:
+                # We are only looking for subscripts on arrays of the current SDFG.
+                # If it is not a subscript, then we just pass the array pointer directly.
+                # If it is not an array of the current SDFG, then the normal
+                # argument parsing will create a connector, i.e. a pointer.
+                if (isinstance(arg, ast.Subscript) and
+                    (rname(arg) in self.sdfg.arrays.keys() or
+                     (rname(arg) in self.variables.keys() and
+                      self.variables[rname(arg)] in self.sdfg.arrays.keys()))):
+                    arg.slice = self.visit(arg.slice)
+                    expr: MemletExpr = ParseMemlet(self, {
+                        **self.sdfg.arrays,
+                        **self.defined
+                    }, arg)
+                    name = rname(arg)
+                    if name in self.variables.keys():
+                        name = self.variables[name]
+                    mpi_args.append((name, expr.subset))
+                else:
+                    mpi_args.append(self._parse_function_arg(arg))
+            args.extend(mpi_args)
+        else:
+            args.extend([self._parse_function_arg(arg) for arg in node.args])
         keywords = {
             arg.arg: self._parse_function_arg(arg.value)
             for arg in node.keywords
@@ -3952,12 +4271,16 @@ class ProgramVisitor(ExtNodeVisitor):
         return node.s
 
     def visit_Num(self, node: ast.Num):
-        if isinstance(node.n, (int, float, complex, bool)):
+        if isinstance(node.n, bool):
+            return dace.bool_(node.n)
+        if isinstance(node.n, (int, float, complex)):
             return dtypes.DTYPE_TO_TYPECLASS[type(node.n)](node.n)
         return node.n
 
     def visit_Constant(self, node: ast.Constant):
-        if isinstance(node.value, (int, float, complex, bool)):
+        if isinstance(node.value, bool):
+            return dace.bool_(node.value)
+        if isinstance(node.value, (int, float, complex)):
             return dtypes.DTYPE_TO_TYPECLASS[type(node.value)](node.value)
         return node.value
 
@@ -4023,7 +4346,7 @@ class ProgramVisitor(ExtNodeVisitor):
                 result.append(
                     (operand, type(self.scope_arrays[operand]).__name__))
             elif isinstance(operand, tuple(dtypes.DTYPE_TO_TYPECLASS.keys())):
-                if isinstance(operand, (bool, numpy.bool, numpy.bool_)):
+                if isinstance(operand, (bool, numpy.bool_)):
                     result.append((operand, 'BoolConstant'))
                 else:
                     result.append((operand, 'NumConstant'))
@@ -4153,9 +4476,24 @@ class ProgramVisitor(ExtNodeVisitor):
                     new_name, _ = self.make_slice(new_name, new_rng)
                     return new_name
 
-        # Obtain array
+        # Obtain array/tuple
         node_parsed = self._gettype(node.value)
+
         if len(node_parsed) > 1:
+            # If the value is a tuple of constants (e.g., array.shape) and the
+            # slice is constant, return the value itself
+            nslice = self.visit(node.slice)
+            if isinstance(nslice, (ast.Index, Number)):
+                if isinstance(nslice, ast.Index):
+                    v = self._parse_value(nslice.value)
+                else:
+                    v = nslice
+                try:
+                    value, valtype = node_parsed[int(v)]
+                    return value
+                except (TypeError, ValueError):
+                    pass  # Passthrough to exception
+
             raise DaceSyntaxError(self, node.value, 'Subscripted object cannot '
                                   'be a tuple')
         array, arrtype = node_parsed[0]
@@ -4164,7 +4502,10 @@ class ProgramVisitor(ExtNodeVisitor):
                                   'Type "%s" cannot be sliced' % arrtype)
 
         # Visit slice contents
-        node.slice = self.visit(node.slice)
+        if isinstance(node.slice, ast.Constant):  # 1D index (since Python 3.9)
+            node.slice = self._visit_ast_or_value(node.slice)
+        else:
+            node.slice = self.visit(node.slice)
 
         # Try to construct memlet from subscript
         # expr: MemletExpr = ParseMemlet(self, self.defined, node)
@@ -4230,17 +4571,28 @@ class ProgramVisitor(ExtNodeVisitor):
         newnode = None
         if result is None:
             return node
-        if isinstance(result, ast.AST):
-            newnode = result
-        elif isinstance(result, Number):
-            # Compatibility check since Python changed their AST nodes
-            if sys.version_info >= (3, 8):
-                newnode = ast.Constant(value=result, kind='')
-            else:
-                newnode = ast.Num(n=result)
+        if isinstance(result, (list, tuple)):
+            res_num = len(result)
         else:
-            newnode = ast.Name(id=result)
-        return ast.copy_location(newnode, node)
+            res_num = 1
+            result = [result]
+        out = []
+        for i, r in enumerate(result):
+            if isinstance(r, ast.AST):
+                newnode = r
+            elif isinstance(r, (Number, numpy.bool_)):
+                # Compatibility check since Python changed their AST nodes
+                if sys.version_info >= (3, 8):
+                    newnode = ast.Constant(value=r, kind='')
+                else:
+                    newnode = ast.Num(n=r)
+            else:
+                newnode = ast.Name(id=r)
+            ast.copy_location(newnode, node)
+            out.append(newnode)
+        if res_num == 1:
+            out = out[0]
+        return out
 
     def visit_Index(self, node: ast.Index) -> Any:
         if isinstance(node.value, ast.Tuple):
@@ -4311,6 +4663,10 @@ class ProgramVisitor(ExtNodeVisitor):
                                     f'"{aname}" not found')
                 shape = desc.shape
             else:  # Literal list or tuple, add as constant and use shape
+                arrname = [
+                    v if isinstance(v, Number) else self._parse_value(v)
+                    for v in arrname
+                ]
                 carr = numpy.array(arrname, dtype=dtypes.typeclass(int).type)
                 cname = self.sdfg.find_new_constant(f'__ind{i}_{aname}')
                 self.sdfg.add_constant(cname, carr)

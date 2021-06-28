@@ -641,7 +641,7 @@ class Range(Subset):
         else:
             raise NotImplementedError
 
-    def squeeze(self, ignore_indices=None):
+    def squeeze(self, ignore_indices=None, offset=True):
         ignore_indices = ignore_indices or []
         shape = self.size()
         non_ones = []
@@ -664,7 +664,8 @@ class Range(Subset):
             squeezed_tsizes = [1]
         self.ranges = squeezed_ranges
         self.tile_sizes = squeezed_tsizes
-        self.offset(self, True, indices=offset_indices)
+        if offset:
+            self.offset(self, True, indices=offset_indices)
         return non_ones
 
     def unsqueeze(self, axes):
@@ -708,6 +709,7 @@ class Range(Subset):
                                   if symbolic.issymbolic(ts) else ts)
 
     def intersects(self, other: 'Range'):
+        type_error = False
         for i, (rng, orng) in enumerate(zip(self.ranges, other.ranges)):
             if (rng[2] != 1 or orng[2] != 1 or self.tile_sizes[i] != 1
                     or other.tile_sizes[i] != 1):
@@ -724,10 +726,16 @@ class Range(Subset):
             cond2 = (orng[0] <= rng[1])
             # NOTE: We have to use the "==" operator because of SymPy returning
             #       a special boolean type!
-            if cond1 == False or cond2 == False:
-                return False
-            if not (cond1 and cond2):
-                return False
+            try:
+                if cond1 == False or cond2 == False:
+                    return False
+                if not (cond1 and cond2):
+                    return False
+            except TypeError:  # cannot determine truth value of Relational
+                type_error = True
+        
+        if type_error:
+            raise TypeError("cannot determine truth value of Relational")
 
         return True
 
